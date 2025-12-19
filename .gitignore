@@ -11,3 +11,4 @@ model.pth
 xtts_model/main/dvae.pth
 xtts_model/main/hash.md5
 xtts_model/main/mel_stats.pth
+__pycache__/

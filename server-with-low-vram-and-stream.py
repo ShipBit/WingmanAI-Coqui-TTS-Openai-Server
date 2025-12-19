@@ -50,8 +50,8 @@ def _resolve_model_locale() -> str:
     return "en"
 
 
-def _find_xtts_speakers_file() -> Path | None:
-    """Best-effort lookup for XTTS2's built-in speaker list on disk."""
+def _xtts_speakers_candidates() -> list[Path]:
+    """Return candidate paths for XTTS2's speakers_xtts.pth."""
     candidates: list[Path] = []
 
     # If user provided a custom model_path, prefer its sibling speakers file.
@@ -65,7 +65,12 @@ def _find_xtts_speakers_file() -> Path | None:
         Path(__file__).resolve().parent / "xtts_model" / "main" / "speakers_xtts.pth"
     )
 
-    for cand in candidates:
+    return candidates
+
+
+def _find_xtts_speakers_file() -> Path | None:
+    """Best-effort lookup for XTTS2's built-in speaker list on disk."""
+    for cand in _xtts_speakers_candidates():
         try:
             if cand.exists() and cand.is_file():
                 return cand
@@ -571,8 +576,13 @@ def openai_tts():
             else:
                 speakers_file = _find_xtts_speakers_file()
                 if speakers_file is None:
+                    searched = ", ".join(
+                        str(p) for p in _xtts_speakers_candidates() if p is not None
+                    )
                     raise FileNotFoundError(
-                        "speakers_xtts.pth not found; cannot use built-in XTTS2 voice"
+                        "speakers_xtts.pth not found; cannot use built-in XTTS2 voice. "
+                        f"Searched: {searched}. "
+                        "Fix: place speakers_xtts.pth next to --model_path (or in xtts_model/main)."
                     )
                 speaker_data = torch.load(speakers_file, map_location="cpu")
                 speaker = list(speaker_data[speaker_idx].values())
