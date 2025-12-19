@@ -630,7 +630,7 @@ def openai_tts():
 
             return Response(generate_chunks(), mimetype=mimetype)
 
-        # If not streaming, just generate on chunk with normal API
+        # If not streaming, just generate one chunk with normal API
         else:
             wavs = api.tts(
                 text,
