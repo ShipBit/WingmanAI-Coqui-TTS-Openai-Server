@@ -7,3 +7,7 @@ config.json
 vocab.json
 speakers_xtts.pth
 model.pth
+.DS_Store
+xtts_model/main/dvae.pth
+xtts_model/main/hash.md5
+xtts_model/main/mel_stats.pth
