@@ -18,7 +18,15 @@ import torch
 import torchaudio
 
 try:
-    from flask import Flask, render_template, render_template_string, request, send_file, jsonify, Response
+    from flask import (
+        Flask,
+        render_template,
+        render_template_string,
+        request,
+        send_file,
+        jsonify,
+        Response,
+    )
 except ImportError as e:
     msg = "Server requires requires flask, use `pip install coqui-tts[server]`"
     raise ImportError(msg) from e
@@ -27,9 +35,71 @@ from TTS.api import TTS
 from TTS.utils.generic_utils import ConsoleFormatter, setup_logger
 from TTS.utils.manage import ModelManager
 from TTS.tts.layers.xtts.tokenizer import VoiceBpeTokenizer
+
 logger = logging.getLogger(__name__)
 setup_logger("TTS", level=logging.INFO, stream=sys.stdout, formatter=ConsoleFormatter())
 xtts_text_cleaner = VoiceBpeTokenizer()
+
+
+def _resolve_model_locale() -> str:
+    # MaryTTS /voices expects a locale string (we approximate using the model_name language segment).
+    if args.model_name is not None:
+        parts = args.model_name.split("/")
+        if len(parts) > 1 and parts[1]:
+            return parts[1]
+    return "en"
+
+
+def _find_xtts_speakers_file() -> Path | None:
+    """Best-effort lookup for XTTS2's built-in speaker list on disk."""
+    candidates: list[Path] = []
+
+    # If user provided a custom model_path, prefer its sibling speakers file.
+    if args.model_path:
+        p = Path(args.model_path)
+        model_dir = p if p.is_dir() else p.parent
+        candidates.append(model_dir / "speakers_xtts.pth")
+
+    # If running from this repo with bundled XTTS model files.
+    candidates.append(
+        Path(__file__).resolve().parent / "xtts_model" / "main" / "speakers_xtts.pth"
+    )
+
+    for cand in candidates:
+        try:
+            if cand.exists() and cand.is_file():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def _get_builtin_voice_names() -> list[str]:
+    """Return the best available list of built-in voice names.
+
+    For XTTS2, this comes from speakers_xtts.pth on disk.
+    For multi-speaker non-XTTS models, falls back to api.speakers.
+    """
+    voices: set[str] = set()
+
+    # Standard multi-speaker models.
+    if api.is_multi_speaker and api.speakers:
+        voices |= {str(s) for s in api.speakers}
+
+    # XTTS2 built-in voices (preferred source for this repo).
+    speakers_file = _find_xtts_speakers_file()
+    if speakers_file is not None:
+        try:
+            speaker_data = torch.load(speakers_file, map_location="cpu")
+            if isinstance(speaker_data, dict):
+                voices |= {str(k) for k in speaker_data.keys()}
+        except Exception as e:
+            logger.warning(
+                "Failed to load XTTS speakers from %s: %s", str(speakers_file), str(e)
+            )
+
+    return sorted(voices)
+
 
 def create_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
@@ -44,11 +114,23 @@ def create_argparser() -> argparse.ArgumentParser:
         default="tts_models/en/ljspeech/tacotron2-DDC",
         help="Name of one of the pre-trained tts models in format <language>/<dataset>/<model_name>",
     )
-    parser.add_argument("--vocoder_name", type=str, default=None, help="Name of one of the released vocoder models.")
-    parser.add_argument("--speaker_idx", type=str, default=None, help="Default speaker ID for multi-speaker models.")
+    parser.add_argument(
+        "--vocoder_name",
+        type=str,
+        default=None,
+        help="Name of one of the released vocoder models.",
+    )
+    parser.add_argument(
+        "--speaker_idx",
+        type=str,
+        default=None,
+        help="Default speaker ID for multi-speaker models.",
+    )
 
     # Args for running custom models
-    parser.add_argument("--config_path", default=None, type=str, help="Path to model config file.")
+    parser.add_argument(
+        "--config_path", default=None, type=str, help="Path to model config file."
+    )
     parser.add_argument(
         "--model_path",
         type=str,
@@ -61,20 +143,61 @@ def create_argparser() -> argparse.ArgumentParser:
         help="Path to vocoder model file. If it is not defined, model uses GL as vocoder. Please make sure that you installed vocoder library before (WaveRNN).",
         default=None,
     )
-    parser.add_argument("--vocoder_config_path", type=str, help="Path to vocoder model config file.", default=None)
-    parser.add_argument("--speakers_file_path", type=str, help="JSON file for multi-speaker model.", default=None)
+    parser.add_argument(
+        "--vocoder_config_path",
+        type=str,
+        help="Path to vocoder model config file.",
+        default=None,
+    )
+    parser.add_argument(
+        "--speakers_file_path",
+        type=str,
+        help="JSON file for multi-speaker model.",
+        default=None,
+    )
     parser.add_argument("--port", type=int, default=5002, help="port to listen on.")
-    parser.add_argument("--device", type=str, help="Device to run model on. Choices: cpu, cuda, cuda:0, cuda:1", default="cpu")
-    parser.add_argument("--use_cuda", action=argparse.BooleanOptionalAction, default=False, help="true to use CUDA.")
     parser.add_argument(
-        "--debug", action=argparse.BooleanOptionalAction, default=False, help="true to enable Flask debug mode."
+        "--device",
+        type=str,
+        help="Device to run model on. Choices: cpu, cuda, cuda:0, cuda:1",
+        default="cpu",
     )
     parser.add_argument(
-        "--show_details", action=argparse.BooleanOptionalAction, default=False, help="Generate model detail page."
+        "--use_cuda",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="true to use CUDA.",
     )
-    parser.add_argument("--language_idx", type=str, help="Default language ID for multilingual models.", default="en")
-    parser.add_argument("--lowvram", action=argparse.BooleanOptionalAction, default=False, help="Use low vram mode, switches device to cpu when idle.")
-    parser.add_argument("--stream", action=argparse.BooleanOptionalAction, default=False, help="Use streaming mode. Only works with XTTS2.")
+    parser.add_argument(
+        "--debug",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="true to enable Flask debug mode.",
+    )
+    parser.add_argument(
+        "--show_details",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Generate model detail page.",
+    )
+    parser.add_argument(
+        "--language_idx",
+        type=str,
+        help="Default language ID for multilingual models.",
+        default="en",
+    )
+    parser.add_argument(
+        "--lowvram",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use low vram mode, switches device to cpu when idle.",
+    )
+    parser.add_argument(
+        "--stream",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use streaming mode. Only works with XTTS2.",
+    )
     return parser
 
 
@@ -91,7 +214,6 @@ vocoder_path = None
 vocoder_config_path = None
 
 
-
 # CASE1: list pre-trained TTS models
 if args.list_models:
     manager.list_models()
@@ -100,7 +222,11 @@ if args.list_models:
 # CASE2: load models
 device = args.device
 if args.use_cuda:
-    warnings.warn("`--use_cuda` is deprecated, use `--device cuda` instead.", DeprecationWarning, stacklevel=2)
+    warnings.warn(
+        "`--use_cuda` is deprecated, use `--device cuda` instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if not "cuda" in device:
         device = "cuda"
 current_device = device
@@ -123,6 +249,7 @@ supports_cloning = api.synthesizer.tts_config.get("model", "") in ["xtts", "bark
 
 try:
     import pyi_splash
+
     pyi_splash.close()
 except:
     pass
@@ -144,6 +271,7 @@ def handle_vram_change(desired_device: str):
                 torch.cuda.empty_cache()
                 gc.collect()
                 current_device = desired_device
+
 
 # Move out of vram if low vram mode until ready to generate
 if args.lowvram and "cuda" in device:
@@ -204,10 +332,11 @@ lock = Lock()
 def tts():
     with lock:
         if args.lowvram:
-            handle_vram_change(device)   
+            handle_vram_change(device)
         text = request.headers.get("text") or request.values.get("text", "")
         speaker_idx = (
-            request.headers.get("speaker-id") or request.values.get("speaker_id", args.speaker_idx)
+            request.headers.get("speaker-id")
+            or request.values.get("speaker_id", args.speaker_idx)
             if api.is_multi_speaker
             else None
         )
@@ -215,20 +344,25 @@ def tts():
             speaker_idx = None
 
         language_idx = (
-            request.headers.get("language-id") or request.values.get("language_id", args.language_idx)
+            request.headers.get("language-id")
+            or request.values.get("language_id", args.language_idx)
             if api.is_multi_lingual
             else None
         )
         if language_idx == "":
             language_idx = None
 
-        style_wav = request.headers.get("style-wav") or request.values.get("style_wav", "")
+        style_wav = request.headers.get("style-wav") or request.values.get(
+            "style_wav", ""
+        )
         style_wav = style_wav_uri_to_dict(style_wav)
-        speaker_wav = request.headers.get("speaker-wav") or request.values.get("speaker_wav", "")
-        
+        speaker_wav = request.headers.get("speaker-wav") or request.values.get(
+            "speaker_wav", ""
+        )
+
         if not text.strip():
             return {"error": "Text parameter is required"}, 400
-            
+
         logger.info("Model input: %s", text)
         logger.info("Speaker idx: %s", speaker_idx)
         logger.info("Speaker wav: %s", speaker_wav)
@@ -240,10 +374,18 @@ def tts():
         try:
             api.synthesizer.seg = api.synthesizer._get_segmenter(language_idx)
         except Exception as e:
-            logger.info(f"Getting segmenter for language: {language_idx} failed, defaulting to English.  Reason: {e}.")
+            logger.info(
+                f"Getting segmenter for language: {language_idx} failed, defaulting to English.  Reason: {e}."
+            )
             api.synthesizer.seg = api.synthesizer._get_segmenter("en")
         try:
-            wavs = api.tts(text, speaker=speaker_idx, language=language_idx, style_wav=style_wav, speaker_wav=speaker_wav)
+            wavs = api.tts(
+                text,
+                speaker=speaker_idx,
+                language=language_idx,
+                style_wav=style_wav,
+                speaker_wav=speaker_wav,
+            )
         except Exception as e:
             logger.error("TTS synthesis failed: %s", str(e))
             return {"error": f"TTS synthesis failed: {str(e)}"}, 500
@@ -285,7 +427,25 @@ def mary_tts_api_voices():
             gender="u",
         )
     return render_template_string(
-        "{{ name }} {{ locale }} {{ gender }}\n", name=model_details[3], locale=model_details[1], gender="u"
+        "{{ name }} {{ locale }} {{ gender }}\n",
+        name=model_details[3],
+        locale=model_details[1],
+        gender="u",
+    )
+
+
+@app.route("/v1/voices", methods=["GET"])
+def openai_list_voices():
+    """JSON list of available built-in voice names.
+
+    Not an official OpenAI endpoint; provided for convenience for clients.
+    """
+    voices = _get_builtin_voice_names()
+    return jsonify(
+        {
+            "object": "list",
+            "data": [{"id": v, "object": "voice"} for v in voices],
+        }
     )
 
 
@@ -294,7 +454,7 @@ def mary_tts_api_process():
     """MaryTTS-compatible /process endpoint"""
     with lock:
         if args.lowvram:
-            handle_vram_change(device)        
+            handle_vram_change(device)
         if request.method == "POST":
             data = parse_qs(request.get_data(as_text=True))
             speaker_idx = data.get("VOICE", [args.speaker_idx])[0]
@@ -329,7 +489,9 @@ def openai_tts():
     payload = request.get_json(force=True)
     logger.info(payload)
     text = payload.get("input") or ""
-    speaker_idx = payload.get("voice", args.speaker_idx) if api.is_multi_speaker else None
+    speaker_idx = (
+        payload.get("voice", args.speaker_idx) if api.is_multi_speaker else None
+    )
     fmt = payload.get("response_format", "mp3").lower()  # OpenAI default is .mp3
     speed = payload.get("speed", 1.0)
     language_idx = args.language_idx if api.is_multi_lingual else None
@@ -339,7 +501,11 @@ def openai_tts():
     if speaker_idx is not None:
         voice_path = Path(speaker_idx)
         if voice_path.exists() and supports_cloning:
-            speaker_wav = str(voice_path) if voice_path.is_file() else [str(w) for w in voice_path.glob("*.wav")]
+            speaker_wav = (
+                str(voice_path)
+                if voice_path.is_file()
+                else [str(w) for w in voice_path.glob("*.wav")]
+            )
             speaker_idx = None
 
     # here we ignore payload["model"] since its loaded at startup
@@ -354,7 +520,7 @@ def openai_tts():
         "pcm": "audio/L16",
     }
     mimetype = mimetypes.get(fmt, "audio/mpeg")
-    
+
     def _save_audio(waveform, sample_rate, format_args):
         buf = io.BytesIO()
         torchaudio.save(buf, waveform, sample_rate, **format_args)
@@ -383,7 +549,9 @@ def openai_tts():
         try:
             api.synthesizer.seg = api.synthesizer._get_segmenter(language_idx)
         except Exception as e:
-            logger.info(f"Getting segmenter for language: {language_idx} failed, defaulting to English.  Reason: {e}.")
+            logger.info(
+                f"Getting segmenter for language: {language_idx} failed, defaulting to English.  Reason: {e}."
+            )
             api.synthesizer.seg = api.synthesizer._get_segmenter("en")
         # If streaming, generate stream chunk-by-chunk for each sentence
         if stream:
@@ -401,10 +569,12 @@ def openai_tts():
                 )
             # if built in xtts2 voice, generate latents for voice
             else:
-                speakers_dir = os.path.join(
-                    Path(args.model_path), "speakers_xtts.pth"
-                )
-                speaker_data = torch.load(speakers_dir)
+                speakers_file = _find_xtts_speakers_file()
+                if speakers_file is None:
+                    raise FileNotFoundError(
+                        "speakers_xtts.pth not found; cannot use built-in XTTS2 voice"
+                    )
+                speaker_data = torch.load(speakers_file, map_location="cpu")
                 speaker = list(speaker_data[speaker_idx].values())
                 gpt_cond_latent = speaker[0]
                 speaker_embedding = speaker[1]
@@ -419,9 +589,11 @@ def openai_tts():
                     # Skip empty or whitespace-only sentences
                     if not sentence.strip():
                         continue
-                    
-                    logger.info(f"Streaming sentence {i+1}/{len(sentences)}: '{sentence}'")
-                    
+
+                    logger.info(
+                        f"Streaming sentence {i+1}/{len(sentences)}: '{sentence}'"
+                    )
+
                     # Get the audio stream iterator for the current sentence
                     waveform_iterator = api.synthesizer.tts_model.inference_stream(
                         sentence,
@@ -429,34 +601,44 @@ def openai_tts():
                         gpt_cond_latent=gpt_cond_latent,
                         speaker_embedding=speaker_embedding,
                         speed=speed,
-                        stream_chunk_size=20, # Default XTTS stream chunk size
+                        stream_chunk_size=20,  # Default XTTS stream chunk size
                     )
-                    
+
                     # Yield all audio chunks from this sentence's stream
                     for chunk in waveform_iterator:
                         # The chunk is a tensor, convert it to the desired format
                         cpu_chunk = chunk.cpu()
-                        
+
                         if cpu_chunk.ndim == 1:
                             cpu_chunk = cpu_chunk.unsqueeze(0)
-                            
+
                         if fmt != "pcm":
                             # This part might be slow for real-time streaming if not using PCM
-                            audio_buffer = _save_audio(cpu_chunk, api.synthesizer.output_sample_rate, {"format": fmt})
+                            audio_buffer = _save_audio(
+                                cpu_chunk,
+                                api.synthesizer.output_sample_rate,
+                                {"format": fmt},
+                            )
                         else:
                             audio_buffer = _save_pcm(cpu_chunk)
-                        
+
                         yield audio_buffer.getvalue()
-                
+
                 # After all sentences, ensure VRAM is cleared if needed
                 if args.lowvram:
                     handle_vram_change("cpu")
 
             return Response(generate_chunks(), mimetype=mimetype)
-        
+
         # If not streaming, just generate on chunk with normal API
         else:
-            wavs = api.tts(text, speaker=speaker_idx, language=language_idx, speaker_wav=speaker_wav, speed=speed)
+            wavs = api.tts(
+                text,
+                speaker=speaker_idx,
+                language=language_idx,
+                speaker_wav=speaker_wav,
+                speed=speed,
+            )
             out = io.BytesIO()
             api.synthesizer.save_wav(wavs, out)
             out.seek(0)
@@ -470,8 +652,12 @@ def openai_tts():
 
             format_dispatch = {
                 "mp3": lambda: _save_audio(waveform, sample_rate, {"format": "mp3"}),
-                "opus": lambda: _save_audio(waveform, sample_rate, {"format": "ogg", "encoding": "opus"}),
-                "aac": lambda: _save_audio(waveform, sample_rate, {"format": "mp4", "encoding": "aac"}),  # m4a container
+                "opus": lambda: _save_audio(
+                    waveform, sample_rate, {"format": "ogg", "encoding": "opus"}
+                ),
+                "aac": lambda: _save_audio(
+                    waveform, sample_rate, {"format": "mp4", "encoding": "aac"}
+                ),  # m4a container
                 "flac": lambda: _save_audio(waveform, sample_rate, {"format": "flac"}),
                 "pcm": lambda: _save_pcm(waveform),
             }
@@ -486,6 +672,7 @@ def openai_tts():
                 handle_vram_change("cpu")
             return send_file(audio_buffer, mimetype=mimetype)
 
+
 @app.route("/v1/models", methods=["GET"])
 def openai_list_models():
     """
@@ -493,11 +680,18 @@ def openai_list_models():
     Returns a list of “models” – here we only expose our TTS model.
     """
     model_id = args.model_name or os.path.basename(args.model_path or "")
-    return jsonify({
-        "data": [
-            {"id": model_id, "object": "model", "created":1234567890, "owned_by": "coqui-tts"}
-        ]
-    })
+    return jsonify(
+        {
+            "data": [
+                {
+                    "id": model_id,
+                    "object": "model",
+                    "created": 1234567890,
+                    "owned_by": "coqui-tts",
+                }
+            ]
+        }
+    )
 
 
 def main():
