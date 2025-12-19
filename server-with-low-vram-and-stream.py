@@ -87,21 +87,30 @@ def _get_builtin_voice_names() -> list[str]:
     """
     voices: set[str] = set()
 
+    is_xtts = api.synthesizer.tts_config.get("model", "") == "xtts"
+
     # Standard multi-speaker models.
     if api.is_multi_speaker and api.speakers:
         voices |= {str(s) for s in api.speakers}
 
-    # XTTS2 built-in voices (preferred source for this repo).
-    speakers_file = _find_xtts_speakers_file()
-    if speakers_file is not None:
-        try:
-            speaker_data = torch.load(speakers_file, map_location="cpu")
-            if isinstance(speaker_data, dict):
-                voices |= {str(k) for k in speaker_data.keys()}
-        except Exception as e:
-            logger.warning(
-                "Failed to load XTTS speakers from %s: %s", str(speakers_file), str(e)
-            )
+    # XTTS2 built-in voices are only valid when an XTTS model is loaded.
+    if is_xtts:
+        speakers_file = _find_xtts_speakers_file()
+        if speakers_file is not None:
+            try:
+                speaker_data = torch.load(speakers_file, map_location="cpu")
+                if isinstance(speaker_data, dict):
+                    voices |= {str(k) for k in speaker_data.keys()}
+            except Exception as e:
+                logger.warning(
+                    "Failed to load XTTS speakers from %s: %s",
+                    str(speakers_file),
+                    str(e),
+                )
+
+    # Single-speaker models: return one default voice.
+    if not voices:
+        voices.add(str(args.speaker_idx) if args.speaker_idx is not None else "default")
 
     return sorted(voices)
 
@@ -491,16 +500,75 @@ def openai_tts():
       "response_format": "wav"    # optional: wav, opus, aac, flac, wav, pcm (alternative to format)
     }
     """
-    payload = request.get_json(force=True)
-    logger.info(payload)
-    text = payload.get("input") or ""
-    speaker_idx = (
-        payload.get("voice", args.speaker_idx) if api.is_multi_speaker else None
+
+    def _parse_bool(val) -> bool:
+        if isinstance(val, bool):
+            return val
+        if val is None:
+            return False
+        return str(val).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    payload = request.get_json(silent=True) or {}
+
+    # Some clients pass OpenAI-compatible fields as query params; accept both.
+    text = (
+        payload.get("input")
+        or payload.get("text")
+        or request.args.get("input")
+        or request.args.get("text")
+        or ""
     )
-    fmt = payload.get("response_format", "mp3").lower()  # OpenAI default is .mp3
-    speed = payload.get("speed", 1.0)
+
+    is_xtts = api.synthesizer.tts_config.get("model", "") == "xtts"
+    requested_voice = payload.get("voice") or request.args.get("voice")
+    speaker_idx = (
+        (requested_voice or args.speaker_idx)
+        if (api.is_multi_speaker or is_xtts)
+        else None
+    )
+
+    fmt = (
+        payload.get("response_format")
+        or payload.get("format")
+        or request.args.get("response_format")
+        or request.args.get("format")
+        or "mp3"
+    ).lower()  # OpenAI default is .mp3
+
+    speed_val = (
+        payload.get("speed") if "speed" in payload else request.args.get("speed")
+    )
+    try:
+        speed = float(speed_val) if speed_val is not None else 1.0
+    except (TypeError, ValueError):
+        speed = 1.0
+
     language_idx = args.language_idx if api.is_multi_lingual else None
-    stream = payload.get("stream") or args.stream or False
+    stream_val = (
+        payload.get("stream") if "stream" in payload else request.args.get("stream")
+    )
+    stream = (
+        _parse_bool(stream_val) if stream_val is not None else (args.stream or False)
+    )
+
+    # Many clients always send a `voice` and/or `stream`. If the loaded model
+    # can't honor those, warn (and fall back) rather than silently ignoring.
+    if requested_voice and not (api.is_multi_speaker or is_xtts):
+        logger.warning(
+            "Requested voice '%s' ignored: loaded model is not XTTS and not multi-speaker. "
+            "Server is currently running model_name=%s model_path=%s.",
+            requested_voice,
+            str(args.model_name),
+            str(args.model_path),
+        )
+    if stream and not is_xtts:
+        logger.warning(
+            "Requested stream=true but loaded model is not XTTS; falling back to non-streaming audio response. "
+            "Server is currently running model_name=%s model_path=%s.",
+            str(args.model_name),
+            str(args.model_path),
+        )
+        stream = False
 
     speaker_wav = None
     if speaker_idx is not None:
@@ -544,9 +612,11 @@ def openai_tts():
         if args.lowvram:
             handle_vram_change(device)
         logger.info("Model input: %s", text)
+        logger.info("Requested voice: %s", requested_voice)
         logger.info("Speaker idx: %s", speaker_idx)
         logger.info("Speaker wav: %s", speaker_wav)
         logger.info("Language idx: %s", language_idx)
+        logger.info("Stream: %s", stream)
         # Clean text for xtts if using xtts
         if api.synthesizer.tts_config.get("model", "") == "xtts":
             text = xtts_text_cleaner.preprocess_text(text, language_idx)
